@@ -1,0 +1,176 @@
+name: 'Set up MediaWiki'
+description: 'Install MediaWiki, optionally with skins and/or extensions, and serve it on localhost.'
+inputs:
+  version:
+    description: 'The version of MediaWiki (and skins and/or extensions) to check out. Must be a valid ref in mediawiki/core.git, such as master (dev branch), REL1_43 (release branch), or 1.43.0 (tag).'
+    default: 'master' # T377562
+  extensions:
+    description: 'Extensions to clone and install, if any. One per line (#-comments and blank lines allowed). Each extension may be a plain name, in which case it is cloned from Wikimedia Gerrit below mediawiki/extensions/, or a full Git URL to clone.'
+    default: ''
+  skins:
+    description: 'Skins to clone and install, if any. One per line (#-comments and blank lines allowed). Each skin may be a plain name, in which case it is cloned from Wikimedia Gerrit below mediawiki/skins/, or a full Git URL to clone.'
+    default: |-
+      Vector
+  local-settings:
+    description: 'Additional settings to append to LocalSettings.php.'
+    default: ''
+  admin-username:
+    description: 'The user name of the initial MediaWiki admin user. Also exposed as the admin-username output.'
+    default: 'CI Wiki Admin'
+  admin-password:
+    description: 'The password of the initial MediaWiki admin user. If blank, a random password is generated. Also exposed as the admin-password output.'
+    default: ''
+  port:
+    description: 'The HTTP port under which to serve MediaWiki.'
+    default: '80'
+outputs:
+  admin-username:
+    description: 'The user name of the initial MediaWiki admin user.'
+    value: '${{ steps.install.outputs.admin-username }}'
+  admin-password:
+    description: 'The password of the initial MediaWiki admin user.'
+    value: '${{ steps.install.outputs.admin-password }}'
+  server:
+    description: 'The $wgServer variable, i.e. the protocol, hostname and port (origin) of the MediaWiki install. May be used to form URLs, though most of the time you probably want one of the other outputs instead.'
+    value: '${{ steps.output.outputs.server }}'
+  script-path:
+    description: 'The $wgScriptPath variable, i.e. the URL path below $wgServer to api.php and other entry points. May be used to form URLs, though most of the time you probably want one of the other outputs instead.'
+    value: '${{ steps.output.outputs.script-path }}'
+  article-path:
+    description: 'The $wgArticlePath variable, i.e. the URL pattern below $wgServer (with $1 replaced by the title) used for internal wiki links. May be used to form URLs.'
+    value: '${{ steps.output.outputs.script-path }}'
+  index-url:
+    description: 'The full URL to the index.php (web) entry point.'
+    value: '${{ steps.output.outputs.index-url }}'
+  api-url:
+    description: 'The full URL of the api.php (Action API) entry point.'
+    value: '${{ steps.output.outputs.api-url }}'
+  rest-url:
+    description: 'The full URL of the rest.php (REST API) entry point.'
+    value: '${{ steps.output.outputs.rest-url }}'
+  install-directory:
+    description: 'The absolute file path on the server of the MediaWiki install directory. May be used to run further maintenance scripts from inside it.'
+    value: '${{ steps.output.outputs.install-directory }}'
+runs:
+  using: 'composite'
+  steps:
+    - name: 'Require Linux'
+      if: "runner.os != 'Linux'"
+      shell: 'bash'
+      run: |
+        printf >&2 'The mediawiki-setup action can only run on a Linux runner.'
+        exit 1
+    - name: 'Clone MediaWiki core'
+      uses: 'actions/checkout@v4'
+      with:
+        repository: 'wikimedia/mediawiki'
+        ref: '${{ inputs.version }}'
+        path: 'w'
+        submodules: 'recursive'
+    - name: 'Clone extensions and skins'
+      shell: 'bash'
+      env:
+        INPUT_VERSION: '${{ inputs.version }}'
+        INPUT_EXTENSIONS: '${{ inputs.extensions }}'
+        INPUT_SKINS: '${{ inputs.skins }}'
+      run: |
+        while IFS= read -r extension; do
+            extension=${extension%#*}
+            extension=${extension%"${extension##*[![:space:]]}"}
+            if [[ ! $extension ]]; then
+                continue
+            fi
+            if [[ ! $extension = */* ]]; then
+                extension="https://gerrit.wikimedia.org/r/mediawiki/extensions/$extension.git"
+            fi
+            git -C w/extensions/ clone --depth=1 --branch="$INPUT_VERSION" --recurse-submodules -- "$extension"
+        done <<< "$INPUT_EXTENSIONS"
+        while IFS= read -r skin; do
+            skin=${skin%#*}
+            skin=${skin%"${skin##*[![:space:]]}"}
+            if [[ ! $skin ]]; then
+                continue
+            fi
+            if [[ ! $skin = */* ]]; then
+                skin="https://gerrit.wikimedia.org/r/mediawiki/skins/$skin.git"
+            fi
+            git -C w/skins/ clone --depth=1 --branch="$INPUT_VERSION" --recurse-submodules -- "$skin"
+        done <<< "$INPUT_SKINS"
+    - name: 'Set up composer-merge-plugin'
+      shell: 'bash'
+      run: |
+        cat > 'w/composer.local.json' << 'EOF'
+        {
+        	"extra": {
+        		"merge-plugin": {
+        			"include": [
+        				"extensions/*/composer.json",
+        				"skins/*/composer.json"
+        			]
+        		}
+        	}
+        }
+        EOF
+    - name: 'Install dependencies'
+      shell: 'bash'
+      run: |
+        composer -d w/ install
+    - name: 'Run installer'
+      id: 'install'
+      shell: 'bash'
+      env:
+        INPUTS_ADMIN_USERNAME: '${{ inputs.admin-username }}'
+        INPUTS_ADMIN_PASSWORD: '${{ inputs.admin-password }}'
+      run: |
+        cd w/
+
+        if [[ -e maintenance/run.php ]]; then
+            install=(php maintenance/run.php install)
+            update=(php maintenance/run.php update)
+        else
+            install=(php maintenance/install.php)
+            update=(php maintenance/run.php)
+        fi
+
+        admin_username=$INPUTS_ADMIN_USERNAME
+        admin_password=$INPUTS_ADMIN_PASSWORD
+        if [[ ! $admin_password ]]; then
+            # (ab)use mktemp(1) as a password generator (16 chars), as pwgen(1) is probably not installed;
+            # modern versions use getrandom(2) so this isn’t as bad as it sounds ;)
+            admin_password=$(mktemp -u XXXXXXXXXXXXXXXX)
+        fi
+
+        "${install[@]}" --dbtype=sqlite --scriptpath=/w --with-extensions --with-developmentsettings --pass="$admin_password" 'CI Wiki' "$admin_username"
+
+        # seems to be necessary for some extensions
+        "${update[@]}" --quick
+
+        printf 'admin-username=%s\nadmin-password=%s\n' "$admin_username" "$admin_password" >> "$GITHUB_OUTPUT"
+    - name: 'Add additional settings'
+      if: "inputs.local-settings != ''"
+      shell: 'bash'
+      env:
+        INPUT_LOCAL_SETTINGS: '${{ inputs.local-settings }}'
+      run: |
+        printf '%s' $'\n# setup-mediawiki local-settings\n' "$INPUT_LOCAL_SETTINGS" $'\n# end setup-mediawiki local-settings\n' >> w/LocalSettings.php
+    - name: 'Export MediaWiki config outputs'
+      id: 'output'
+      shell: 'bash'
+      run: |
+        cd w/
+
+        if [[ -e maintenance/run.php ]]; then
+            eval=(php maintenance/run.php eval)
+        else
+            eval=(php maintenance/eval.php)
+        fi
+
+        "${eval[@]}" <<< 'echo "server=$wgServer\nscript-path=$wgScriptPath\narticle-path=$wgArticlePath\nindex-url=$wgServer" . wfScript() . "\napi-url=$wgServer" . wfScript( "api.php" ) . "\nrest-url=$wgServer" . wfScript( "rest.php" )' >> "$GITHUB_OUTPUT"
+        printf 'install-directory=%s\n' "$PWD" >> "$GITHUB_OUTPUT"
+    - name: 'Start PHP web server'
+      shell: 'bash'
+      env:
+        INPUT_PORT: '${{ inputs.port }}'
+      run: |
+        sudo php -S localhost:"$INPUT_PORT" &
+        disown -h -a
