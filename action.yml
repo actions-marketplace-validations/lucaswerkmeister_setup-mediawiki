@@ -121,6 +121,7 @@ runs:
       env:
         INPUTS_ADMIN_USERNAME: '${{ inputs.admin-username }}'
         INPUTS_ADMIN_PASSWORD: '${{ inputs.admin-password }}'
+        INPUTS_PORT: '${{ inputs.port }}'
       run: |
         cd w/
 
@@ -140,7 +141,12 @@ runs:
             admin_password=$(mktemp -u XXXXXXXXXXXXXXXX)
         fi
 
-        "${install[@]}" --dbtype=sqlite --scriptpath=/w --with-extensions --with-developmentsettings --pass="$admin_password" 'CI Wiki' "$admin_username"
+        server=http://localhost
+        if [[ $INPUTS_PORT != 80 ]]; then
+            server=$server:$INPUTS_PORT
+        fi
+
+        "${install[@]}" --dbtype=sqlite --server="$server" --scriptpath=/w --with-extensions --with-developmentsettings --pass="$admin_password" 'CI Wiki' "$admin_username"
 
         # seems to be necessary for some extensions
         "${update[@]}" --quick
